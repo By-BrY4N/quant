@@ -11,7 +11,9 @@ from quantlab.backtest import (
     BacktestConfig,
     BacktestSnapshot,
     closed_trade_pnl_by_exit_timestamp,
+    prepare_backtest,
     run_backtest,
+    run_backtest_window,
 )
 from quantlab.domain import Candle, PortfolioState, Side, StrategyName
 from quantlab.ledger import apply_fill
@@ -51,6 +53,83 @@ def _snapshot(candles: tuple[Candle, ...], label: str) -> BacktestSnapshot:
 
 
 class BacktestCausalityTest(unittest.TestCase):
+    def test_window_can_skip_unused_baselines_without_changing_candidate_metrics(self) -> None:
+        snapshot = _snapshot(_minute_fixture(16), "window-baseline-reuse")
+        config = BacktestConfig(
+            strategy=StrategyName.SMA_CROSS,
+            decision_timeframe="1h",
+            fee_bps_per_side=Decimal("10"),
+            slippage_bps_per_side=Decimal("5"),
+            sma_fast=1,
+            sma_slow=2,
+        )
+        start = datetime(2024, 1, 1, 4, 0, tzinfo=UTC)
+        end = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+
+        complete = run_backtest_window(
+            snapshot, config, start_at_utc=start, end_at_utc=end,
+        )
+        prepared = prepare_backtest(snapshot, config)
+        full_run = run_backtest(snapshot, config)
+        prepared_full_run = run_backtest(snapshot, config, prepared=prepared)
+        candidate_and_benchmark = run_backtest_window(
+            snapshot, config, start_at_utc=start, end_at_utc=end,
+            include_cash=False,
+        )
+        candidate_only = run_backtest_window(
+            snapshot, config, start_at_utc=start, end_at_utc=end,
+            include_cash=False, include_buy_hold=False,
+        )
+        prepared_candidate_only = run_backtest_window(
+            snapshot, config, start_at_utc=start, end_at_utc=end,
+            include_cash=False, include_buy_hold=False, prepared=prepared,
+        )
+
+        complete_results = {item.strategy: item for item in complete.results}
+        benchmark_results = {item.strategy: item for item in candidate_and_benchmark.results}
+        candidate_result = next(item for item in candidate_only.results if item.strategy == config.strategy)
+        prepared_candidate_result = next(
+            item for item in prepared_candidate_only.results if item.strategy == config.strategy
+        )
+        self.assertEqual(
+            set(benchmark_results),
+            {StrategyName.SMA_CROSS, StrategyName.BUY_HOLD},
+        )
+        self.assertEqual(set(candidate_only.audit["vetoes_by_strategy"]), {"SMA_CROSS"})
+        self.assertEqual(
+            complete_results[StrategyName.SMA_CROSS].metrics,
+            candidate_result.metrics,
+        )
+        self.assertEqual(
+            complete_results[StrategyName.BUY_HOLD].metrics,
+            benchmark_results[StrategyName.BUY_HOLD].metrics,
+        )
+        self.assertEqual(candidate_result.metrics, prepared_candidate_result.metrics)
+        self.assertEqual(candidate_result.signals, prepared_candidate_result.signals)
+        self.assertEqual(candidate_result.fills, prepared_candidate_result.fills)
+        self.assertEqual(candidate_result.equity, prepared_candidate_result.equity)
+        full_results = {item.strategy: item for item in full_run.results}
+        prepared_full_results = {item.strategy: item for item in prepared_full_run.results}
+        self.assertEqual(set(full_results), set(prepared_full_results))
+        for strategy, expected in full_results.items():
+            actual = prepared_full_results[strategy]
+            self.assertEqual(expected.metrics, actual.metrics)
+            self.assertEqual(expected.signals, actual.signals)
+            self.assertEqual(expected.fills, actual.fills)
+            self.assertEqual(expected.equity, actual.equity)
+
+        changed_signal_config = BacktestConfig(
+            strategy=StrategyName.SMA_CROSS,
+            decision_timeframe="1h",
+            sma_fast=1,
+            sma_slow=3,
+        )
+        with self.assertRaisesRegex(ValueError, "outra configuração"):
+            run_backtest_window(
+                snapshot, changed_signal_config, start_at_utc=start, end_at_utc=end,
+                prepared=prepared,
+            )
+
     def test_closed_trade_pnl_includes_entry_and_exit_fees_once(self) -> None:
         state = PortfolioState(cash_usdt=Decimal("1000"), base_qty=Decimal("0"))
         state, buy = apply_fill(

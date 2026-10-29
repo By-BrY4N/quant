@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
 
 from quantlab.domain import Candle, PortfolioState, Side, SimulatedFill, StrategyName, TargetExposure
 from quantlab.engine import SIMULATED_BASE_QTY_STEP
@@ -156,6 +157,29 @@ class SignalEvent:
     execution_status: str = "PENDING"
     execution_at_utc: datetime | None = None
     veto_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSignalTemplate:
+    strategy: StrategyName
+    generated_at_utc: datetime
+    available_at_utc: datetime
+    eligible_at_utc: datetime
+    target_exposure: Decimal
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestPreparation:
+    """Reusable snapshot/timeframe preparation shared across one F5 trial."""
+
+    snapshot: BacktestSnapshot = field(compare=False, repr=False)
+    decision_timeframe: str
+    signal_config: tuple[object, ...]
+    decision_candles: tuple[DecisionCandle, ...]
+    discarded_incomplete_windows: int
+    strategy_signals: tuple[PreparedSignalTemplate, ...]
+    warmup_discarded: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,7 +336,7 @@ def _aggregate_decision_candles(
 
 def _strategy_signals(
     strategy: StrategyName,
-    decision_candles: list[DecisionCandle],
+    decision_candles: Sequence[DecisionCandle],
     first_minute: Candle,
     config: BacktestConfig,
 ) -> tuple[list[SignalEvent], int]:
@@ -447,9 +471,90 @@ def _strategy_signals(
     return signals, warmup_discarded
 
 
+def _signal_config_key(config: BacktestConfig) -> tuple[object, ...]:
+    """Fields that can change the causal decision bars or target signals."""
+    return (
+        config.strategy,
+        config.decision_timeframe,
+        config.assumed_data_delay_seconds,
+        config.sma_fast,
+        config.sma_slow,
+        config.breakout_lookback,
+        config.momentum_lookback,
+        config.mean_reversion_lookback,
+        config.mean_reversion_entry_z,
+        config.mean_reversion_exit_z,
+    )
+
+
+def prepare_backtest(snapshot: BacktestSnapshot, config: BacktestConfig) -> BacktestPreparation:
+    """Aggregate and calculate a rule's causal signals once for reusable F5 windows."""
+    if config.strategy in EXTERNAL_TARGET_STRATEGIES:
+        raise ValueError("preparação F5 não aceita estratégia com targets externos")
+    decision_candles, discarded = _aggregate_decision_candles(
+        snapshot.candles_1m, config.decision_timeframe,
+    )
+    if not decision_candles:
+        raise ValueError(
+            f"snapshot {snapshot.snapshot_id} não contém janela completa de {config.decision_timeframe}"
+        )
+    signals, warmup_discarded = _strategy_signals(
+        config.strategy, decision_candles, snapshot.candles_1m[0], config,
+    )
+    return BacktestPreparation(
+        snapshot=snapshot,
+        decision_timeframe=config.decision_timeframe,
+        signal_config=_signal_config_key(config),
+        decision_candles=tuple(decision_candles),
+        discarded_incomplete_windows=discarded,
+        strategy_signals=tuple(
+            PreparedSignalTemplate(
+                strategy=signal.strategy,
+                generated_at_utc=signal.generated_at_utc,
+                available_at_utc=signal.available_at_utc,
+                eligible_at_utc=signal.eligible_at_utc,
+                target_exposure=signal.target_exposure,
+                reason=signal.reason,
+            )
+            for signal in signals
+        ),
+        warmup_discarded=warmup_discarded,
+    )
+
+
+def _validate_preparation(
+    snapshot: BacktestSnapshot,
+    config: BacktestConfig,
+    prepared: BacktestPreparation,
+) -> None:
+    if prepared.snapshot is not snapshot:
+        raise ValueError("preparação pertence a outro objeto snapshot")
+    if (
+        prepared.decision_timeframe != config.decision_timeframe
+        or prepared.signal_config != _signal_config_key(config)
+    ):
+        raise ValueError("preparação pertence a outra configuração de sinais")
+
+
+def _copy_signal(signal: PreparedSignalTemplate) -> SignalEvent:
+    """Create an independent mutable execution event from an immutable template."""
+    return SignalEvent(
+        strategy=signal.strategy,
+        generated_at_utc=signal.generated_at_utc,
+        available_at_utc=signal.available_at_utc,
+        eligible_at_utc=signal.eligible_at_utc,
+        target_exposure=signal.target_exposure,
+        reason=signal.reason,
+    )
+
+
+def _copy_signals(signals: Sequence[PreparedSignalTemplate]) -> list[SignalEvent]:
+    return [_copy_signal(signal) for signal in signals]
+
+
 def _external_target_signals(
     strategy: StrategyName,
-    decision_candles: list[DecisionCandle],
+    decision_candles: Sequence[DecisionCandle],
     config: BacktestConfig,
     targets_by_decision_end: Mapping[datetime, Decimal | TargetExposure],
 ) -> list[SignalEvent]:
@@ -692,11 +797,25 @@ def _simulate_strategy(
     )
 
 
-def run_backtest(snapshot: BacktestSnapshot, config: BacktestConfig) -> BacktestResult:
+def run_backtest(
+    snapshot: BacktestSnapshot,
+    config: BacktestConfig,
+    *,
+    prepared: BacktestPreparation | None = None,
+) -> BacktestResult:
     """Executa estratégia e benchmarks com um único ledger/fill model."""
-    decision_candles, discarded_windows = _aggregate_decision_candles(
-        snapshot.candles_1m, config.decision_timeframe
-    )
+    if prepared is None:
+        decision_candles, discarded_windows = _aggregate_decision_candles(
+            snapshot.candles_1m, config.decision_timeframe
+        )
+        prepared_signals: Sequence[PreparedSignalTemplate] | None = None
+        prepared_warmup = 0
+    else:
+        _validate_preparation(snapshot, config, prepared)
+        decision_candles = prepared.decision_candles
+        discarded_windows = prepared.discarded_incomplete_windows
+        prepared_signals = prepared.strategy_signals
+        prepared_warmup = prepared.warmup_discarded
     if not decision_candles:
         raise ValueError(
             f"snapshot {snapshot.snapshot_id} não contém janela completa de {config.decision_timeframe}"
@@ -726,9 +845,13 @@ def run_backtest(snapshot: BacktestSnapshot, config: BacktestConfig) -> Backtest
     results: list[StrategyResult] = []
     warmup_by_strategy: dict[str, int] = {}
     for strategy in strategies:
-        signals, warmup_discarded = _strategy_signals(
-            strategy, decision_candles, snapshot.candles_1m[0], config
-        )
+        if prepared_signals is not None and strategy == selected:
+            signals = _copy_signals(prepared_signals)
+            warmup_discarded = prepared_warmup
+        else:
+            signals, warmup_discarded = _strategy_signals(
+                strategy, decision_candles, snapshot.candles_1m[0], config
+            )
         warmup_by_strategy[strategy.value] = warmup_discarded
         results.append(
             _simulate_strategy(snapshot.candles_1m, strategy, signals, config)
@@ -775,6 +898,9 @@ def run_backtest_window(
     end_at_utc: datetime,
     evidence_level: str = "WALK_FORWARD",
     target_overrides: Mapping[StrategyName, Mapping[datetime, Decimal | TargetExposure]] | None = None,
+    include_cash: bool = True,
+    include_buy_hold: bool = True,
+    prepared: BacktestPreparation | None = None,
 ) -> BacktestResult:
     """Evaluate a window using the snapshot's earlier bars only as causal warm-up."""
     if start_at_utc.tzinfo is None or end_at_utc.tzinfo is None:
@@ -783,10 +909,13 @@ def run_backtest_window(
     end = end_at_utc.astimezone(UTC)
     if end <= start:
         raise ValueError("fim da janela deve ser posterior ao início")
-    evaluation_candles = tuple(
-        candle for candle in snapshot.candles_1m
-        if candle.open_at_utc >= start and candle.end_at_utc <= end
+    first_candle = bisect_left(
+        snapshot.candles_1m, start, key=lambda candle: candle.open_at_utc,
     )
+    past_candles = bisect_right(
+        snapshot.candles_1m, end, key=lambda candle: candle.end_at_utc,
+    )
+    evaluation_candles = snapshot.candles_1m[first_candle:past_candles]
     if not evaluation_candles:
         raise ValueError("janela de avaliação sem candles 1m completos")
 
@@ -798,19 +927,27 @@ def run_backtest_window(
     if unsupported:
         raise ValueError("target_overrides aceita somente estratégias ML F6")
 
-    decision_candles, discarded_windows = _aggregate_decision_candles(
-        snapshot.candles_1m, config.decision_timeframe
-    )
-    strategy_signals, warmup_discarded = _strategy_signals(
-        config.strategy, decision_candles, snapshot.candles_1m[0], config
-    )
+    if prepared is None:
+        decision_candles, discarded_windows = _aggregate_decision_candles(
+            snapshot.candles_1m, config.decision_timeframe,
+        )
+        strategy_signals, warmup_discarded = _strategy_signals(
+            config.strategy, decision_candles, snapshot.candles_1m[0], config,
+        )
+    else:
+        _validate_preparation(snapshot, config, prepared)
+        decision_candles = prepared.decision_candles
+        discarded_windows = prepared.discarded_incomplete_windows
+        strategy_signals = prepared.strategy_signals
+        warmup_discarded = prepared.warmup_discarded
     if config.strategy in {StrategyName.CASH, StrategyName.BUY_HOLD}:
         strategy_signals, warmup_discarded = _strategy_signals(
             config.strategy, decision_candles, evaluation_candles[0], config
         )
     signals = [
-        item for item in strategy_signals
-        if item.generated_at_utc >= start and item.generated_at_utc < end
+        _copy_signal(item) if prepared is not None else item
+        for item in strategy_signals
+        if start <= item.generated_at_utc < end
     ]
     scheduled_signals: list[SignalEvent] = []
     for signal in signals:
@@ -820,12 +957,13 @@ def run_backtest_window(
         else:
             scheduled_signals.append(signal)
 
-    strategies = tuple(dict.fromkeys((
-        config.strategy,
-        StrategyName.CASH,
-        StrategyName.BUY_HOLD,
-        *overrides.keys(),
-    )))
+    requested_strategies = [config.strategy]
+    if include_cash:
+        requested_strategies.append(StrategyName.CASH)
+    if include_buy_hold:
+        requested_strategies.append(StrategyName.BUY_HOLD)
+    requested_strategies.extend(overrides)
+    strategies = tuple(dict.fromkeys(requested_strategies))
     results: list[StrategyResult] = []
     warmup_by_strategy: dict[str, int] = {}
     for strategy in strategies:

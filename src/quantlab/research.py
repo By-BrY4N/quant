@@ -16,12 +16,14 @@ from typing import Any, Iterator, Mapping
 from uuid import uuid4
 
 from quantlab.backtest import (
+    BacktestPreparation,
     BacktestConfig,
     BacktestResult,
     BacktestSnapshot,
     StrategyResult,
     TIMEFRAME_MINUTES,
     _aggregate_decision_candles,
+    prepare_backtest,
     run_backtest,
     run_backtest_window,
 )
@@ -236,8 +238,17 @@ def _run_metrics(result: StrategyResult) -> dict[str, str | int | bool]:
     }
 
 
-def _contiguous_segments(snapshot: BacktestSnapshot, timeframe: str) -> tuple[list[list[Any]], int]:
-    bars, discarded = _aggregate_decision_candles(snapshot.candles_1m, timeframe)
+def _contiguous_segments(
+    snapshot: BacktestSnapshot,
+    timeframe: str,
+    prepared: BacktestPreparation | None = None,
+) -> tuple[list[list[Any]], int]:
+    if prepared is None:
+        bars, discarded = _aggregate_decision_candles(snapshot.candles_1m, timeframe)
+    else:
+        if prepared.snapshot is not snapshot or prepared.decision_timeframe != timeframe:
+            raise ResearchError("Preparação não corresponde ao snapshot/timeframe dos folds.")
+        bars, discarded = prepared.decision_candles, prepared.discarded_incomplete_windows
     segments: list[list[Any]] = []
     current: list[Any] = []
     for bar in bars:
@@ -257,10 +268,11 @@ def build_walk_forward_folds(
     train_bars: int,
     test_bars: int,
     max_folds: int = 5,
+    prepared: BacktestPreparation | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if train_bars < 2 or test_bars < 1 or not 1 <= max_folds <= 5:
         raise ResearchError("Folds exigem treino >= 2 barras, teste >= 1 e no máximo 5 folds.")
-    segments, discarded_windows = _contiguous_segments(snapshot, decision_timeframe)
+    segments, discarded_windows = _contiguous_segments(snapshot, decision_timeframe, prepared)
     folds: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
     if discarded_windows:
@@ -337,6 +349,7 @@ def _stress_result(
     multiplier: int,
     *,
     evidence_level: str = "WALK_FORWARD",
+    prepared: BacktestPreparation | None = None,
 ) -> dict[str, Any]:
     stressed = replace(
         config,
@@ -349,6 +362,9 @@ def _stress_result(
         start_at_utc=_utc(str(fold["test_start_at_utc"])),
         end_at_utc=_utc(str(fold["test_end_at_utc_exclusive"])),
         evidence_level=evidence_level,
+        include_cash=False,
+        include_buy_hold=False,
+        prepared=prepared,
     )
     selected = next(item for item in result.results if item.strategy == config.strategy)
     return {
@@ -762,7 +778,8 @@ def record_trial(root: Path, experiment_id: str, config: BacktestConfig) -> dict
     try:
         snapshot = load_backtest_snapshot(root, experiment["development_snapshot_id"])
         development_extent = _snapshot_extent(root, snapshot.snapshot_id)
-        backtest_run = run_backtest(snapshot, config)
+        prepared = prepare_backtest(snapshot, config)
+        backtest_run = run_backtest(snapshot, config, prepared=prepared)
         run_artifacts = write_backtest_artifacts(root / "artifacts" / "backtests", backtest_run)
         wf = spec["walk_forward"]
         folds, exclusions = build_walk_forward_folds(
@@ -771,6 +788,7 @@ def record_trial(root: Path, experiment_id: str, config: BacktestConfig) -> dict
             train_bars=int(wf["train_bars"]),
             test_bars=int(wf["test_bars"]),
             max_folds=int(wf["max_folds"]),
+            prepared=prepared,
         )
         fold_results: list[dict[str, Any]] = []
         for fold in folds:
@@ -780,18 +798,20 @@ def record_trial(root: Path, experiment_id: str, config: BacktestConfig) -> dict
             test_end = _utc(str(fold["test_end_at_utc_exclusive"]))
             train_result = run_backtest_window(
                 snapshot, config, start_at_utc=train_start, end_at_utc=train_end,
-                evidence_level="WALK_FORWARD",
+                evidence_level="WALK_FORWARD", include_cash=False, prepared=prepared,
             )
             test_result = run_backtest_window(
                 snapshot, config, start_at_utc=test_start, end_at_utc=test_end,
-                evidence_level="WALK_FORWARD",
+                evidence_level="WALK_FORWARD", include_cash=False, prepared=prepared,
             )
             fold_results.append({
                 **fold,
                 "training": _fold_range_metrics(train_result, train_start, train_end),
                 "test": _fold_range_metrics(test_result, test_start, test_end),
                 "cost_stress": {
-                    f"{multiplier}x": _stress_result(snapshot, config, fold, multiplier)
+                    f"{multiplier}x": _stress_result(
+                        snapshot, config, fold, multiplier, prepared=prepared,
+                    )
                     for multiplier in (2, 3)
                 },
                 "warmup_policy": "somente barras anteriores; caixa reinicia em dinheiro no início de cada recorte",

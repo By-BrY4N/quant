@@ -367,3 +367,41 @@ print(f"UI_OK pages=Dados,Backtests,Operações,Runs anteriores runs={len(runs)}
 - F3 full-year é IN_SAMPLE para os períodos de treino/validação. O walk-forward de um ano foi montado depois de visualizar métricas anuais, e o walk-forward de 24 meses inclui uma validação já vista; ambos são diagnósticos exploratórios.
 - Fee 10 bps, slippage 5 bps por lado e atraso 1s são hipóteses. Não há spread separado, evidência de fills reais, classificação causal de regime, bootstrap, DSR, PBO, Reality Check ou teste de capacidade.
 - Backtests históricos não provam lucratividade futura. Não foram implementadas corretora, ordens reais ou chamadas de compra/venda.
+
+## Otimização focal de pesquisa F5 — 2026-10-29
+
+### Implementado
+
+- `run_backtest_window` agora permite selecionar os baselines necessários. F5 deixa de simular CASH nas janelas de treino/teste e deixa de simular CASH e BUY_HOLD nos stresses 2x/3x; os resultados usados pelos relatórios continuam presentes. Chamadas existentes mantêm o padrão completo por default.
+- Adicionado `prepare_backtest` para agregar candles e calcular os sinais causais uma vez por trial. F5 passa essa preparação ao backtest principal, à geração de folds e às janelas walk-forward. Cada simulação recebe novos eventos de sinal, preservando o isolamento do ledger e do estado mutável do evento.
+- Janelas de avaliação agora usam busca binária nos candles ordenados do snapshot em vez de varrer toda a série para localizar início/fim.
+- O fluxo de ledger continua serial por carteira. DuckDB já usa quatro threads neste computador para consultas; não foi criado paralelismo de processo, dependência GPU ou engine alternativo.
+
+### Arquivos alterados
+
+- `src/quantlab/backtest.py`
+- `src/quantlab/research.py`
+- `tests/test_backtest_timing.py`
+- `docs/DECISIONS.md`
+- `docs/CHANGELOG_IMPL.md`
+
+### Comandos e verificações
+
+- `uv run python -m unittest discover -s tests -p test_backtest_timing.py -v` — 3 testes passaram, incluindo comparação de métricas/fills/equity entre execução completa, baseline seletivo e sinais preparados.
+- `uv run python -m unittest discover -s tests -p test_research_f5.py -v` — 1 teste F5 passou; inclui a execução de um trial sintético, folds e o bloqueio do holdout para abertura repetida.
+- Medição de desempenho foi executada com um script Python temporário via `uv run python -`, sobre `snapshot-6128f04036bd63e5480e52ca49e0db99` (527.040 candles de desenvolvimento BTC), uma janela walk-forward de 60 dias em 4h e custos de 1x/2x/3x. Não foram escritos runs/trials, alterado SQLite, aberto holdout, feito download ou chamado endpoint de ordem.
+- Antes: três janelas com todas as simulações de baseline — 7,76 s. Depois: preparo + folds 1,13 s e as três janelas com apenas as simulações necessárias 1,69 s — 2,82 s no total, redução medida de 63,7%. Retorno SMA verificado idêntico nos dois lados: -5,5292163593%, -7,2144800271% e -8,8696858879% respectivamente. O teste apenas confirmou equivalência de código; estes valores continuam sendo resultados históricos exploratórios.
+- Carregar/verificar/materializar o snapshot mediu 11,63–15,18 s em execuções distintas e não foi otimizado nesta alteração. DuckDB informou `current_setting('threads') = 4`; o host tem Intel i3-9100F, 4 núcleos/4 threads e GPU GTX 1660 6 GB. O backtester usa `Decimal` e estado dependente do tempo, sem operação adequada para GPU. Threads não aceleram esses loops Python sob o GIL; processos no Windows precisariam serializar/copiar o snapshot. Não foi alegado uso paralelo do backtester nem aceleração por GPU.
+
+### Roteiro manual
+
+1. Abra a aplicação com `uv run streamlit run src/quantlab/ui/app.py --server.address 127.0.0.1`.
+2. Em **Pesquisa**, selecione uma versão OPEN e seu snapshot de desenvolvimento; mantenha o holdout SELADO.
+3. Execute um trial pré-registrado. O backtest completo mantém CASH/BUY_HOLD; os folds mantêm BUY_HOLD para comparação e calculam os stresses somente para a estratégia avaliada.
+4. Confira o `trial.json` e `report.html`, compare número de folds, parâmetros, custos e resultados com o trial registrado. A otimização não muda limites, sinais, taxas, fills ou critério de seleção.
+
+### Limitações
+
+- O benchmark mediu uma janela real já usada para desenvolvimento, não toda a execução `record_trial`; o tempo total de um trial, RAM de pico e desempenho em outros ativos/timeframes não foram medidos.
+- Não houve benchmark GPU ou multiprocessing. Com este padrão de ledger sequencial, isso não se justifica sem uma operação vetorizável medida e um desenho que não replique memória sem controle.
+- Nenhum resultado do holdout final foi aberto. Backtests permanecem históricos exploratórios e não demonstram rentabilidade futura.
