@@ -1,0 +1,31 @@
+# Python bytecode and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Tool caches and generated packaging files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# User data and generated runs; keep small synthetic fixtures in data/fixtures/
+data/raw/
+data/curated/
+data/quarantine/
+data/catalog.sqlite3
+state/
+artifacts/

@@ -1,0 +1,24 @@
+[project]
+name = "quantlab"
+version = "0.1.0"
+description = "Laboratório local de pesquisa quantitativa com demo offline sintética"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "duckdb>=1.4,<2",
+    "pandas>=2.2,<3",
+    "plotly>=6,<7",
+    "scikit-learn>=1.7,<2",
+    "streamlit>=1.50,<2",
+    "websockets>=14,<18",
+]
+
+[project.scripts]
+quantlab = "quantlab.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = true

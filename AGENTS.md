@@ -1,0 +1,9 @@
+# QuantLab - regras estáveis de trabalho
+
+- Antes de implementar uma fase, leia por inteiro `docs/PLANO_FINAL_QUANTLAB_IMPLEMENTACAO_2026.md`; ele prevalece sobre planos anteriores. Trabalhe somente na fase indicada e entregue primeiro um fluxo manual utilizável.
+- Não reescreva o plano, não antecipe fases futuras e não crie arquitetura vazia. Priorize um caminho end-to-end funcional, Streamlit usável e artefatos HTML/JSON.
+- Evite testes redundantes e ciclos longos de validação. Por padrão, não rode suítes gerais, múltiplos typechecks/lints ou verificações repetidas sem autorização. Faça apenas verificações focadas necessárias ao risco e à mudança; no máximo uma rodada focal, um smoke end-to-end e um lint focalizado por fase. Um único teste geral por gate, quando autorizado ou previsto para aquele gate. Se uma verificação falhar, corrija e repita somente a que falhou. Não rode pytest global, fuzz, carga ou benchmark por hábito. Corrija bugs conhecidos de dinheiro, tempo, checksum ou segurança, reduzindo o escopo de validação se necessário.
+- Preserve temporalidade e dinheiro: sem futuro em sinais, sem fill antes do instante elegível, sem fee duplicada e sem saldo negativo. Raw é imutável. Não implemente corretora, live trading ou chamadas reais de compra/venda.
+- Use fixtures sintéticas determinísticas; não baixe anos de dados. Identifique claramente dados sintéticos e reais. Nunca adicione credenciais, chaves privadas ou endpoints de ordem real.
+- Não altere metodologia silenciosamente. Registre novas decisões e limitações reais em `docs/DECISIONS.md` e `docs/CHANGELOG_IMPL.md`; não declare executado o que não foi verificado.
+- Ao fechar cada fase, informe o que foi implementado, arquivos alterados, comandos exatos, roteiro manual, verificações executadas e limitações, além do que fica para fases futuras.
